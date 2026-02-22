@@ -1,27 +1,3 @@
-"""
-orchestrator.py — The brain of the restaurant booking pipeline.
-
-Endpoints:
-    POST /vapi/tools        Vapi calls this when the assistant uses a tool
-    POST /vapi/events       Vapi calls this for all call lifecycle events
-    GET  /bookings          View all bookings
-    GET  /health            Health check
-
-Full pipeline:
-    1. User calls Vapi inbound number and speaks their request
-    2. Vapi calls /vapi/tools → search_restaurants
-       → scraper.py hits rtrvr.ai and returns restaurant list
-    3. User picks a restaurant (or Vapi picks the best one)
-    4. Vapi calls /vapi/tools → initiate_booking
-       → server triggers outbound call to restaurant
-    5. Restaurant call ends → /vapi/events → captures confirmation
-       → Google Calendar event created
-       → Outbound call to user to confirm
-
-Start server:
-    uvicorn orchestrator:app --reload --port 8000
-"""
-
 import os
 import requests
 from dotenv import load_dotenv
@@ -45,8 +21,6 @@ SERVER_URL      = os.getenv("SERVER_BASE_URL", "http://localhost:8000")
 app = FastAPI(title="Restaurant Booking Orchestrator")
 
 
-# ── Vapi call helper ──────────────────────────────────────────────────────────
-
 def _make_vapi_call(customer_phone: str, system_prompt: str, first_message: str, variables: dict = None) -> dict:
     headers = {
         "Authorization": f"Bearer {PRIVATE_KEY}",
@@ -62,6 +36,10 @@ def _make_vapi_call(customer_phone: str, system_prompt: str, first_message: str,
                 "model": "gpt-4o",
                 "systemPrompt": system_prompt,
             },
+            "voice": {
+                "provider": "minimax",
+                "voiceId": "Friendly_Person",
+            },
             "firstMessage": first_message,
             "serverUrl": f"{SERVER_URL}/vapi/events",
         },
@@ -74,13 +52,7 @@ def _make_vapi_call(customer_phone: str, system_prompt: str, first_message: str,
     return resp.json()
 
 
-# ── Tool handlers ─────────────────────────────────────────────────────────────
-
 def handle_search_restaurants(args: dict) -> dict:
-    """
-    Called by Vapi when the user describes what they want.
-    Args expected: query, location, date, time, party_size
-    """
     query      = args.get("query", "")
     location   = args.get("location", "")
     date       = args.get("date", "today")
@@ -94,19 +66,13 @@ def handle_search_restaurants(args: dict) -> dict:
     if not restaurants:
         return {"message": "Sorry, I couldn't find any Indian restaurants in that area. Can you try a different location?"}
 
-    spoken = format_for_vapi(restaurants)
     return {
-        "message": spoken,
+        "message": format_for_vapi(restaurants),
         "restaurants": restaurants,
     }
 
 
 def handle_initiate_booking(args: dict, call_metadata: dict) -> dict:
-    """
-    Called by Vapi when the user confirms they want to book.
-    Args expected: restaurant_name, restaurant_phone, restaurant_address,
-                   date, time, party_size, customer_name
-    """
     restaurant_name  = args.get("restaurant_name", "")
     restaurant_phone = args.get("restaurant_phone", "")
     address          = args.get("restaurant_address", "")
@@ -117,7 +83,6 @@ def handle_initiate_booking(args: dict, call_metadata: dict) -> dict:
 
     print(f"[TOOL] initiate_booking | {restaurant_name} | {restaurant_phone} | {date} {time_str} for {party_size}")
 
-    # Create a booking record
     booking_id = state_store.create_booking(
         customer_name=customer_name,
         customer_phone=MY_PHONE,
@@ -129,7 +94,6 @@ def handle_initiate_booking(args: dict, call_metadata: dict) -> dict:
         party_size=party_size,
     )
 
-    # Outbound call to the restaurant
     restaurant_system_prompt = f"""
 You are an AI assistant calling {restaurant_name} to make a table reservation.
 
@@ -140,7 +104,7 @@ Reservation details:
 - Party size: {party_size} people
 
 Be polite and concise. Confirm the booking and repeat back the confirmed date, time, and name.
-When the booking is confirmed, say exactly: "Booking confirmed for {customer_name}, {party_size} people on {date} at {time_str}. Thank you!"
+When the booking is confirmed, say: "Booking confirmed for {customer_name}, {party_size} people on {date} at {time_str}. Thank you!"
 Then end the call politely.
 """
     restaurant_first_message = (
@@ -171,21 +135,15 @@ Then end the call politely.
     }
 
 
-# ── Vapi tools endpoint ───────────────────────────────────────────────────────
-
 @app.post("/vapi/tools")
 async def vapi_tools(request: Request):
-    """
-    Vapi calls this endpoint whenever the assistant invokes a tool (function call).
-    """
     body = await request.json()
     print(f"[VAPI TOOL CALL] {body}")
 
-    message      = body.get("message", {})
-    tool_calls   = message.get("toolCalls", [])
-    call_meta    = message.get("call", {})
-
-    results = []
+    message    = body.get("message", {})
+    tool_calls = message.get("toolCalls", [])
+    call_meta  = message.get("call", {})
+    results    = []
 
     for tool_call in tool_calls:
         fn      = tool_call.get("function", {})
@@ -200,23 +158,14 @@ async def vapi_tools(request: Request):
         else:
             result = {"message": f"Unknown tool: {name}"}
 
-        results.append({
-            "toolCallId": call_id,
-            "result": result.get("message", "Done."),
-        })
+        results.append({"toolCallId": call_id, "result": result.get("message", "Done.")})
 
     return JSONResponse({"results": results})
 
 
-# ── Vapi events endpoint ──────────────────────────────────────────────────────
-
 @app.post("/vapi/events")
 async def vapi_events(request: Request):
-    """
-    Vapi sends all call lifecycle events here.
-    Set this as your Server URL in the Vapi dashboard.
-    """
-    body = await request.json()
+    body       = await request.json()
     message    = body.get("message", {})
     event_type = message.get("type", "unknown")
     call       = message.get("call", {})
@@ -224,22 +173,21 @@ async def vapi_events(request: Request):
 
     print(f"[VAPI EVENT] {event_type} | call_id={call_id}")
 
-    # ── Restaurant call ended ─────────────────────────────────────────────────
     if event_type == "end-of-call-report":
         booking = state_store.get_booking_by_call_id(call_id)
 
         if booking and booking["status"] == "calling_restaurant":
-            transcript  = message.get("transcript", "")
-            summary     = message.get("summary", "")
+            transcript   = message.get("transcript", "")
+            summary      = message.get("summary", "")
             ended_reason = call.get("endedReason", "")
 
             print(f"[ORCHESTRATOR] Restaurant call ended | reason={ended_reason}")
-            print(f"[ORCHESTRATOR] Summary: {summary}")
 
-            # Treat call as confirmed if it ended normally
-            confirmed = ended_reason in ("assistant-ended-call", "customer-ended-call", "silence-timed-out") \
-                        or "confirmed" in transcript.lower() \
-                        or "reservation" in transcript.lower()
+            confirmed = (
+                ended_reason in ("assistant-ended-call", "customer-ended-call", "silence-timed-out")
+                or "confirmed" in transcript.lower()
+                or "reservation" in transcript.lower()
+            )
 
             if confirmed:
                 state_store.update_booking(
@@ -247,8 +195,6 @@ async def vapi_events(request: Request):
                     status="confirmed",
                     confirmation_details=summary or transcript[:300],
                 )
-
-                # Add to Google Calendar
                 cal_result = add_booking_to_calendar(
                     restaurant_name=booking["restaurant_name"],
                     address=booking["location"],
@@ -258,26 +204,19 @@ async def vapi_events(request: Request):
                     customer_name=booking["customer_name"],
                 )
                 state_store.update_booking(booking["id"], calendar_event_id=cal_result.get("event_id"))
-
-                # Call the user back to confirm
                 _notify_user(booking)
-
             else:
                 state_store.update_booking(booking["id"], status="failed")
                 print(f"[ORCHESTRATOR] Booking may have failed — check transcript.")
 
-        # ── User confirmation call ended ──────────────────────────────────────
         elif booking and booking["status"] == "notifying_user":
             state_store.update_booking(booking["id"], status="notified")
-            print(f"[ORCHESTRATOR] ✅ Full pipeline complete for booking {booking['id']}")
+            print(f"[ORCHESTRATOR] Pipeline complete for booking {booking['id']}")
 
     return JSONResponse({"status": "received"})
 
 
-# ── User notification call ────────────────────────────────────────────────────
-
 def _notify_user(booking: dict):
-    """Trigger an outbound call to the user confirming their booking."""
     system_prompt = f"""
 You are an AI assistant calling {booking['customer_name']} to confirm their restaurant reservation.
 
@@ -289,8 +228,8 @@ Booking details:
 - Party size: {booking['party_size']} people
 - Reservation name: {booking['customer_name']}
 
-Tell them the booking is confirmed, give them all the details, and let them know 
-it has been added to their Google Calendar. Be warm and brief. Then say goodbye.
+Tell them the booking is confirmed, share the details, and let them know it has been added 
+to their Google Calendar. Be warm and brief, then say goodbye.
 """
     first_message = (
         f"Hi {booking['customer_name']}! I'm calling to confirm your table reservation "
@@ -314,8 +253,6 @@ it has been added to their Google Calendar. Be warm and brief. Then say goodbye.
         print(f"[ORCHESTRATOR] Failed to call user: {e}")
 
 
-# ── Utility routes ────────────────────────────────────────────────────────────
-
 @app.get("/bookings")
 async def get_bookings():
     return JSONResponse(state_store.all_bookings())
@@ -325,8 +262,6 @@ async def get_bookings():
 async def health():
     return {"status": "ok", "server": SERVER_URL}
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn

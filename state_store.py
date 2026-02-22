@@ -1,11 +1,3 @@
-"""
-state_store.py — Persists booking state across async Vapi calls.
-
-Since the pipeline spans multiple async calls (user call → restaurant call → 
-confirmation call), we persist state to a JSON file so nothing is lost between
-webhook events.
-"""
-
 import json
 import os
 import uuid
@@ -37,28 +29,24 @@ def create_booking(
     time: str,
     party_size: int,
 ) -> str:
-    """Create a new booking record and return its ID."""
-    bookings = _load()
+    bookings   = _load()
     booking_id = str(uuid.uuid4())
     bookings[booking_id] = {
-        "id": booking_id,
-        "status": "pending",           # pending → calling_restaurant → confirmed → notified
-        "created_at": datetime.utcnow().isoformat(),
-
-        "customer_name": customer_name,
-        "customer_phone": customer_phone,
-
-        "restaurant_name": restaurant_name,
+        "id":           booking_id,
+        "status":       "pending",  # pending → calling_restaurant → confirmed → notifying_user → notified
+        "created_at":   datetime.utcnow().isoformat(),
+        "customer_name":    customer_name,
+        "customer_phone":   customer_phone,
+        "restaurant_name":  restaurant_name,
         "restaurant_phone": restaurant_phone,
-        "location": location,
-        "date": date,
-        "time": time,
-        "party_size": party_size,
-
-        "restaurant_call_id": None,
+        "location":     location,
+        "date":         date,
+        "time":         time,
+        "party_size":   party_size,
+        "restaurant_call_id":   None,
         "confirmation_call_id": None,
         "confirmation_details": None,
-        "calendar_event_id": None,
+        "calendar_event_id":    None,
     }
     _save(bookings)
     return booking_id
@@ -69,7 +57,6 @@ def get_booking(booking_id: str) -> Optional[dict]:
 
 
 def get_booking_by_call_id(call_id: str) -> Optional[dict]:
-    """Find a booking by its Vapi call ID (restaurant or confirmation call)."""
     for booking in _load().values():
         if booking.get("restaurant_call_id") == call_id:
             return booking
@@ -79,7 +66,6 @@ def get_booking_by_call_id(call_id: str) -> Optional[dict]:
 
 
 def update_booking(booking_id: str, **kwargs):
-    """Update one or more fields on a booking."""
     bookings = _load()
     if booking_id not in bookings:
         raise KeyError(f"Booking {booking_id} not found")
